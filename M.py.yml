@@ -1,0 +1,36 @@
+# .github/workflows/bot-deployment.yml
+
+name: Python Bot Deployment
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytelegrambotapi pytz telebot requests pymongo collection # Install the dependencies
+        
+    - name: Run the bot script
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}  # Set bot token via GitHub Secrets
+      run: |
+        chmod +x *  # Make sure the script is executable
+        python m.py  # Run the bot script
